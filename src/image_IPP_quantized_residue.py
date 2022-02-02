@@ -10,8 +10,8 @@ import L_DWT as L
 import H_DWT as H
 import deadzone_quantizer as Q
 import motion
-import frame
-import colors
+import image_3 as frame
+import colored
 import cv2
 import os
 import random
@@ -19,7 +19,7 @@ import math
 import image_IPP
 import distortion
 import values
-import debug
+#import debug
 import copy
 from scipy.fftpack import dct, idct
 import information
@@ -34,11 +34,20 @@ if config.color == "YCrCb":
 if config.color == "RGB":
     import RGB as YUV
 
+import logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(format="[%(filename)s:%(lineno)s %(funcName)s()] %(message)s")
+#logger.setLevel(logging.CRITICAL)
+#logger.setLevel(logging.ERROR)
+logger.setLevel(logging.WARNING)
+#logger.setLevel(logging.INFO)
+#logger.setLevel(logging.DEBUG)
+
 class image_IPP_quantized_residue_codec(image_IPP.image_IPP_codec):
 
-    def encode(self, video, n_frames, q_step):
+    def encode(self, video, first_frame, n_frames, q_step):
         try:
-            k = 0
+            k = first_frame
             W_k = frame.read(video, k).astype(np.int16)
             initial_flow = np.zeros((W_k.shape[0], W_k.shape[1], 2), dtype=np.float32)
             blocks_in_y = int(W_k.shape[0]/self.block_y_side)
@@ -53,10 +62,10 @@ class image_IPP_quantized_residue_codec(image_IPP.image_IPP_codec):
             #print("000000000000000", dequantized_E_k.shape)
             frame.write(self.clip(YUV.to_RGB(reconstructed_V_k)), f"{video}reconstructed_", k) # Decoder's output
             reconstructed_V_k_1 = reconstructed_V_k # (j)
-            for k in range(1, n_frames):
+            for k in range(first_frame + 1, first_frame + n_frames):
                 W_k = frame.read(video, k).astype(np.int16)
                 V_k = YUV.from_RGB(W_k) # (a)
-                flow = motion.estimate(V_k[...,0], V_k_1[...,0], initial_flow) # (c)
+                flow = motion.Farneback_ME(V_k[...,0], V_k_1[...,0], initial_flow) # (c)
                 V_k_1 = V_k # (b)
                 reconstructed_flow = self.V_codec(flow, self.log2_block_side, f"{video}motion_", k) # (d and e)
                 prediction_V_k = motion.make_prediction(reconstructed_V_k_1, reconstructed_flow) # (j)
@@ -75,7 +84,7 @@ class image_IPP_quantized_residue_codec(image_IPP.image_IPP_codec):
                     #DCT_block = dct(block)
                     #print("%%%%% medio", DCT_block.max(), DCT_block.min(), q_step)
                     #print("DCT_block =", DCT_block)
-                    dequantized_DCT_block = Q.quan_dequan(DCT_block, q_step)
+                    dequantized_DCT_block = Q.quan_dequan(DCT_block, q_step)[0]
                     #print("dequantized_DCT_block =", dequantized_DCT_block)
                     dequantized_block = idct(dequantized_DCT_block, norm='ortho').astype(np.int16)
                     #dequantized_block = idct(dequantized_DCT_block).astype(np.int16)
@@ -179,22 +188,22 @@ class image_IPP_quantized_residue_codec(image_IPP.image_IPP_codec):
                 reconstructed_V_k_1 = reconstructed_V_k # (j)
 
         except:
-            print(colors.red(f'image_IPP_adaptive_codec.encode(video="{video}", n_frames={n_frames}, q_step={q_step})'))
+            print(colored.fore.RED + f'image_IPP_adaptive_codec.encode(video="{video}", n_frames={n_frames}, q_step={q_step})')
             raise
 
     def T_codec(self, types, prefix, frame_number):
         for y in range(types.shape[0]):
             for x in range(types.shape[1]):
-                debug.print(types[y][x], end=' ')
+                logger.info(types[y][x], end=' ')
             print()
         frame.write(types, prefix + "types_", frame_number)
 
-    def compute_br(self, prefix, frames_per_second, frame_shape, n_frames):
-        kbps, bpp , n_bytes = image_IPP.compute_br(prefix, frames_per_second, frame_shape, n_frames)
+    def compute_br(self, prefix, frames_per_second, frame_shape, first_frame, n_frames):
+        kbps, bpp , n_bytes = image_IPP.compute_br(prefix, frames_per_second, frame_shape, first_frame, n_frames)
 
         # I/B-Types.
         command = f"cat {prefix}types_???.png | gzip -9 > /tmp/image_IPP_adaptive_types.gz"
-        debug.print(command)
+        logger.info(command)
         os.system(command)
         types_length = os.path.getsize(f"/tmp/image_IPP_adaptive_types.gz")
         frame_height = frame_shape[0]
@@ -208,8 +217,8 @@ class image_IPP_quantized_residue_codec(image_IPP.image_IPP_codec):
         return kbps + types_kbps, bpp + types_bpp, types_length + n_bytes
 
 codec = image_IPP_quantized_residue_codec()
-def encode(video, n_frames, q_step):
-    codec.encode(video, n_frames, q_step)
+def encode(video, first_frame, n_frames, q_step):
+    codec.encode(video, first_frame, n_frames, q_step)
 
-def compute_br(prefix, frames_per_second, frame_shape, n_frames):
-    return codec.compute_br(prefix, frames_per_second, frame_shape, n_frames)
+def compute_br(prefix, frames_per_second, frame_shape, first_frame, n_frames):
+    return codec.compute_br(prefix, frames_per_second, frame_shape, first_frame, n_frames)
