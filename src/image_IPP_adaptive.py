@@ -34,6 +34,7 @@ import copy
 import block_DCT as DCT
 import color_DCT as color
 import information
+import deadzone_quantizer as deadzone
 #########################GABRIEL#######################
 
 import logging
@@ -60,32 +61,146 @@ class image_IPP_adaptive_codec(image_IPP.image_IPP_codec):
         super().create_structures(W_k, block_y_side, block_x_side)
         self.block_types = np.zeros((int(W_k.shape[0]/block_y_side), int(W_k.shape[1]/block_x_side)), dtype=np.uint8)
 
+    def R_RD_Curve(self, RGB_img, Q_step, components, quantizer):
+        return self.RD_curve(RGB_img, Q_step, 'R', components, quantizer)
+
+    def G_RD_curve(self, RGB_img, Q_step, components, quantizer):
+        return self.RD_curve(RGB_img, Q_step, 'G', components, quantizer)
+
+    def B_RD_curve(self, RGB_img, Q_step, components, quantizer):
+        return self.RD_curve(RGB_img, Q_step, 'B', components, quantizer)
+
+    def RD_curve(self, RGB_img, Q_step, component, components, quantizer):
+        RGB_img -= 128
+        RD_points = [(0, 100000, component, 256)]
+
+        component_index = components.index(component)
+        component_img = RGB_img[..., component_index]
+        dequantized_component_img, k = quantizer.quan_dequan(component_img, Q_step)
+        k = (k + 128).astype(np.uint8)
+        BPP = common.bits_per_gray_pixel(k, component + str(Q_step) + '_')
+        RMSE = distortion.RMSE(component_img, dequantized_component_img)
+        RD_points.append((BPP, RMSE, component, Q_step))
+        return BPP
+
+    def get_RD_curve_sorted_by_slopes(RGB_img, sorted_slopes, components, quantizer, q_step):
+        RGB_img -= 128
+        points = []
+        Q_steps_per_component = [256, 256, 256] # This should generate a black image.
+        #Q_steps_per_component = [128, 128, 128] # This should generate a black image.
+        for i in sorted_slopes:
+                if i[2] == q_step:
+                   k = np.empty_like(RGB_img)
+                   y = np.empty_like(RGB_img)
+                   #point = i[1]
+                   #component = point[2]
+                   component = i[1]
+                   #Q_step = point[3]
+                   Q_step = i[2]
+                   Q_steps_per_component[components.index(component)] = Q_step
+                   #print(i, Q_steps_per_component)
+                   for c, QS in zip(components, Q_steps_per_component):
+                       y[..., components.index(c)], k[..., components.index(c)] = quantizer.quan_dequan(RGB_img[..., components.index(c)], QS)
+
+                   k = (k + 128).astype(np.uint8)
+                   rate = common.bits_per_color_pixel(k, str(Q_steps_per_component) + '_')
+                   _distortion = distortion.RMSE(RGB_img, y)
+                   points.append((rate, _distortion))
+        return rate
+
+    def compute_slopes(RD_points):
+        extended_RD_points = [(0.0, 0.0, '', -1)] + RD_points
+        counter = 0
+        RD_slopes = []
+        points_iterator = iter(RD_points)
+        next(points_iterator)
+        for i in points_iterator:
+            BPP = i[0] # Rate 
+            #print(RD_points[counter])
+            #delta_BPP = BPP - extended_RD_points[counter][0]
+            delta_BPP = BPP - RD_points[counter][0]
+            RMSE = i[1] # Distortion
+            #delta_RMSE = RMSE - extended_RD_points[counter][1] 
+            delta_RMSE = RMSE - RD_points[counter][1] 
+            #print(f"q_step={1<<q_step:>3}, rate={rate:>7} bytes, distortion={_distortion:>6.1f}")
+            if delta_BPP > 0:
+               slope = abs(delta_RMSE/delta_BPP)
+            else:
+               slope = 0
+            component = i[2]
+            Q_step = i[3]
+            RD_slopes.append((slope, component, Q_step))
+            counter += 1
+        return RD_slopes
+
     def decide_types(self, video, k, q_step, W_k, reconstructed_W_k, E_k, prediction_W_k, block_y_side, block_x_side, averages):
         return self.decide_types_0(video, k, q_step, W_k, reconstructed_W_k, E_k, prediction_W_k, block_y_side, block_x_side, averages)
         #return self.decide_types_1(video, k, q_step, W_k, reconstructed_W_k, E_k, prediction_W_k, block_y_side, block_x_side, averages)
         
     def decide_types_0(self, video, k, q_step, W_k, reconstructed_W_k, E_k, prediction_W_k, block_y_side, block_x_side, averages):
         # I/P/S-type block decission based on the entropy of the block.
-        DCT_blocks = DCT.analyze_image(W_k, block_y_side, block_x_side)
-        DCT_blocks_k = DCT.uniform_quantize(DCT_blocks, block_y_side, block_x_side, 3, q_step)
-        DCT_blocks_dQ = DCT.uniform_dequantize(DCT_blocks_k, block_y_side, block_x_side, 3, q_step)
-        YUV_frame_dQ = DCT.synthesize_image(DCT_blocks_dQ, block_y_side, block_x_side)
-        for y in range(int(YUV_frame_dQ.shape[0]/block_y_side)):
-            for x in range(int(YUV_frame_dQ.shape[1]/block_x_side)):
-                E_k_block_entropy = \
-                    self.entropy(E_k[y*block_y_side:(y+1)*block_y_side,
-                                     x*block_x_side:(x+1)*block_x_side][..., 0])
-                W_k_block_entropy = \
-                    self.entropy(YUV_frame_dQ[y*block_y_side:(y+1)*block_y_side,
-                                     x*block_x_side:(x+1)*block_x_side][..., 0])
-                #print(E_k_block_entropy)
-                if E_k_block_entropy < 5:#106:
+        quantizer = deadzone
+        Q_steps = [2**i for i in range(7, -1, -1)]
+        components = ['R', 'G', 'B']
+
+        for y in range(int(W_k.shape[0]/block_y_side)):
+            for x in range(int(W_k.shape[1]/block_x_side)):
+
+                R_avg_energy = information.average_energy(W_k[...,0])
+                G_avg_energy = information.average_energy(W_k[...,1])
+                B_avg_energy = information.average_energy(W_k[...,2])
+
+                R_avg_energy1 = information.average_energy(E_k[...,0])
+                G_avg_energy1 = information.average_energy(E_k[...,1])
+                B_avg_energy1 = information.average_energy(E_k[...,2])
+
+                total_RGB_avg_energy = R_avg_energy + G_avg_energy + B_avg_energy
+                #total_RGB_avg_energy = R_avg_energy
+                #total_RGB_avg_energy1 = R_avg_energy1
+
+                RGB_img = W_k.astype(np.int16) - 128 # Quantized data must be centered at 0
+                RGB_img1 = E_k.astype(np.int16) - 128 # Quantized data must be centered at 0
+
+                R_points = R_RD_Curve(RGB_img, Q_step, components, quantizer)
+                G_points = G_RD_curve(RGB_img, Q_step, components, quantizer)
+                B_points = B_RD_curve(RGB_img, Q_step, components, quantizer)
+
+                R_points1 = R_RD_curve(RGB_img1, Q_step, components, quantizer)
+                G_points1 = G_RD_curve(RGB_img1, Q_step, components, quantizer)
+                B_points1 = B_RD_curve(RGB_img1, Q_step, components, quantizer)
+
+
+                R_slopes = compute_slopes(R_points)
+                G_slopes = compute_slopes(G_points)
+                B_slopes = compute_slopes(B_points)
+
+                R_slopes1 = compute_slopes(R_points1)
+                G_slopes1 = compute_slopes(G_points1)
+                B_slopes1 = compute_slopes(B_points1)
+
+                all_slopes = R_slopes + G_slopes + B_slopes
+                all_slopes1 = R_slopes1 + G_slopes1 + B_slopes1
+                sorted_slopes = sorted(all_slopes, key=lambda x: x[0])[::-1]
+                sorted_slopes1 = sorted(all_slopes1, key=lambda x: x[0])[::-1]
+
+                all_slopes = R_slopes + G_slopes + B_slopes
+                sorted_slopes = sorted(all_slopes, key=lambda x: x[0])[::-1]
+
+                all_slopes1 = R_slopes1 + G_slopes1 + B_slopes1
+                sorted_slopes1 = sorted(all_slopes1, key=lambda x: x[0])[::-1]
+
+                RD_points_sorted_by_slopes = get_RD_curve_sorted_by_slopes(RGB_img, sorted_slopes, components, quantizer, q_step)
+                RD_points_sorted_by_slopes1 = get_RD_curve_sorted_by_slopes(RGB_img1, sorted_slopes1, components, quantizer, q_step)
+                #all_slopes = R_slopes
+                #all_slopes1 = R_slopes1
+
+                if RD_points_sorted_by_slopes1 < 5:#106:
                     print('.', end='') # Skipped
                     self.block_types[y, x] = 2
                     E_k[y*block_y_side:(y+1)*block_y_side,
                         x*block_x_side:(x+1)*block_x_side] = 0
                 else:
-                    if E_k_block_entropy < W_k_block_entropy:
+                    if RD_points_sorted_by_slopes1 < RD_points_sorted_by_slopes:
                         print('P', end='')
                         self.block_types[y, x] = 0
                     else:
@@ -99,14 +214,31 @@ class image_IPP_adaptive_codec(image_IPP.image_IPP_codec):
                                        x*block_x_side:(x+1)*block_x_side] = averages[y, x]
                         self.block_types[y, x] = 1
             print('')
+
+        #CODEC################
+        #DCT_blocks = DCT.analyze_image(W_k, block_y_side, block_x_side)
+        #DCT_blocks_k = DCT.uniform_quantize(DCT_blocks, block_y_side, block_x_side, 3, q_step)
+        #DCT_blocks_dQ = DCT.uniform_dequantize(DCT_blocks_k, block_y_side, block_x_side, 3, q_step)
+        #YUV_frame_dQ = DCT.synthesize_image(DCT_blocks_dQ, block_y_side, block_x_side)
+        #CODEC###################
         self.T_codec(self.block_types, video, k)
-	# Regenerate the reconstructed residue using the I-type blocks
+        # Regenerate the reconstructed residue using the I-type blocks
         dequantized_E_k = super().E_codec4(E_k, f"{video}texture_", k, q_step) # (g and h)
 
         reconstructed_W_k = dequantized_E_k + prediction_W_k[:dequantized_E_k.shape[0], :dequantized_E_k.shape[1]] # (i)
         logger.info(f"reconstructed_W_k {reconstructed_W_k.max()} {reconstructed_W_k.min()}")
         #logger.info(f"YUV_frame_dQ {YUV_frame_dQ.max()} {YUV_frame_dQ.min()}")
         return reconstructed_W_k
+
+    def same_delta_RD_curve(RGB_img, Q_step, quantizer):
+        RGB_img -= 128
+        points = []
+        y, k = quantizer.quan_dequan(RGB_img, Q_step)
+        k = (k + 128).astype(np.uint8)
+        rate = common.bits_per_color_pixel(k, str(Q_step) + '_')
+        _distortion = distortion.RMSE(RGB_img, y)
+        points.append((rate, _distortion))
+        return points
 
     def decide_types_1(self, video, k, q_step, W_k, reconstructed_W_k, E_k, prediction_W_k, block_y_side, block_x_side, averages):
         # I/P-type block decission based on the entropy of the block.
